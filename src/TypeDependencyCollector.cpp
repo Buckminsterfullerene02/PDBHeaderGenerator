@@ -1,6 +1,7 @@
 #include "TypeDependencyCollector.h"
 #include <iostream>
 #include <ranges>
+#include <Utils/TextWriter.h>
 
 TypeDependency::TypeDependency(const CComPtr<IDiaSymbol>& InDependencySymbol) : DependencySymbol(InDependencySymbol)
 {
@@ -203,6 +204,10 @@ void TypeDependencyCollectorBase::CollectDependenciesForTemplateInstantiation( c
         {
             DeclarationsToCheck.push_back(Argument.TypeConstant);
         }
+        if ( Argument.Type == ETemplateArgumentType::TypeMemberReference )
+        {
+            DeclarationsToCheck.push_back(Argument.TypeMemberReference.OwnerType);
+        }
     }
 
     std::vector<const EnumTypeDeclaration*> TopLevelEnums;
@@ -213,7 +218,12 @@ void TypeDependencyCollectorBase::CollectDependenciesForTemplateInstantiation( c
         const std::shared_ptr<ITypeDeclaration> Decl = DeclarationsToCheck[i];
         if ( Decl->GetId() == ETypeDeclarationId::PointerType )
         {
-            DeclarationsToCheck.push_back( static_cast<const PointerTypeDeclaration*>( Decl.get() )->PointeeType );
+            const PointerTypeDeclaration* PointerType = static_cast<const PointerTypeDeclaration*>( Decl.get() );
+            DeclarationsToCheck.push_back( PointerType->PointeeType );
+            if ( PointerType->OwnerType )
+            {
+                DeclarationsToCheck.push_back( PointerType->OwnerType );
+            }
         }
         else if ( Decl->GetId() == ETypeDeclarationId::ArrayType )
         {
@@ -291,12 +301,15 @@ void TypeDependencyCollectorBase::CollectDependenciesForTemplateInstantiation( c
         if ( TypeDeclaration->TemplateArguments.Arguments.empty() )
         {
             const CComPtr<IDiaSymbol> UDTSymbol = TypeResolver->ResolveUDTByFullName( SymbolNameInfo.ToString( SymbolNameInfo::IncludeNamespace ) );
-            assert( UDTSymbol && L"Failed to resolve UDT type used as a template instantiation argument" );
 
             // We only need a pre-declaration for this type since it has no template arguments
             if ( UDTSymbol )
             {
                 AddDependency( TypeDependency::UserDefinedType( UDTSymbol ), !bTemplateNeedsFullType );
+            }
+            else
+            {
+                std::wcerr << L"Failed to resolve UDT type used as a template instantiation argument: " << SymbolNameInfo.ToString() << L". This will result in a compilation error unless manual definition is provided." << std::endl;
             }
         }
         // If we have template arguments, we need to either resolve the template instantiation symbol (which is extremely slow for templates with huge amount of instantiations)
@@ -313,12 +326,17 @@ void TypeDependencyCollectorBase::CollectDependenciesForTemplateInstantiation( c
             }
 
             // Use slow path using the iteration across all template instantiations in the database in case this is our own type.
-            const CComPtr<IDiaSymbol> InstantiationSymbol = TypeResolver->ResolveTemplateInstantiation( SymbolNameInfo, TypeDeclaration->TemplateArguments );
-
-            assert( InstantiationSymbol && L"Failed to resolve template instantiation used as a template argument for non-external type." );
-            if ( InstantiationSymbol )
+            if ( const CComPtr<IDiaSymbol> InstantiationSymbol = TypeResolver->ResolveTemplateInstantiation( SymbolNameInfo, TypeDeclaration->TemplateArguments ) )
             {
                 AddDependency( TypeDependency::UserDefinedType( InstantiationSymbol ), !bTemplateNeedsFullType );
+            }
+            else
+            {
+                FormattedTextWriter TemplateArgumentsText;
+                TypeDeclaration->TemplateArguments.Print(TemplateArgumentsText, TypeFormattingRules());
+
+                // This a pretty serious error that will result in a compilation error, but it is normal for some template types in some cases (e.g. non-type arguments only templates) to be absent
+                std::wcerr << L"Failed to resolve template instantiation used as a template argument for non-external type " << SymbolNameInfo.ToString() << L". Template Arguments: " << TemplateArgumentsText.ToString() << std::endl;
             }
         }
     }

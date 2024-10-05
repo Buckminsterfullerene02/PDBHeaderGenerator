@@ -350,6 +350,10 @@ void UDTDataMemberDeclaration::Print(FormattedTextWriter& TextWriter, const Type
     {
         TextWriter.Append(L"const ");
     }
+    else if ( bIsThreadLocal )
+    {
+        TextWriter.Append(L"thread_local ");
+    }
 
     // Print type and member name
     MemberType->PrintVariableType( TextWriter, Rules, MemberName );
@@ -399,7 +403,7 @@ void UDTDeclarationData::PrintUDT(FormattedTextWriter& TextWriter, const TypeFor
 
         if ( bIsDllImport )
         {
-            TextWriter.Append(L"__declspec(dllimport) ");
+            TextWriter.Append(L"DLLIMPORT ");
         }
         TextWriter.AppendFormat(L"%s", ClassName.c_str());
 
@@ -510,10 +514,6 @@ void GlobalDataDeclaration::Print(FormattedTextWriter& TextWriter, const Declara
         assert( !bIsTemplateSpecialization );
         TextWriter.Append(L"extern \"C\" ");
     }
-    else if ( bIsDllImport )
-    {
-        TextWriter.Append(L"extern ");
-    }
     if ( bIsTemplateSpecialization )
     {
         TextWriter.Append(L"template<> ");
@@ -528,7 +528,7 @@ void GlobalDataDeclaration::Print(FormattedTextWriter& TextWriter, const Declara
     }
     if ( bIsDllImport )
     {
-        TextWriter.Append(L"__declspec(dllimport) ");
+        TextWriter.Append(L"DLLIMPORT ");
     }
 
     // Print type and member name

@@ -217,6 +217,21 @@ void CompilationUnit::CollectAndRegisterDependencies( int32_t& CurrentActionNumb
     }
 }
 
+void CompilationUnit::SanitizeGlobalMemberNameForHeaderFilename(std::wstring& SymbolName)
+{
+    // Move all operators into a single file since they would result in filenames like operator+/operator*/operator++, which are not valid
+    // TODO: Ideally such functions should be grouped into the headers of the types on which these operators operate. This is just a workaround that does not actually let you use these operators
+    if (SymbolName.starts_with(L"operator"))
+    {
+        SymbolName = L"GlobalOperatorOverloads";
+    }
+    // Sanitize dangerous internal names that might contain a question mark
+    if (SymbolName.find(L'?') != std::wstring::npos)
+    {
+        nlohmann::detail::replace_substring<std::wstring>(SymbolName, L"?", L"_");
+    }
+}
+
 CompilationUnitReferenceCollector::CompilationUnitReferenceCollector(CompilationUnit* InCompilationUnit) : TypeDependencyCollectorBase( InCompilationUnit->GetHeaderGenerator() ), mCompilationUnit( InCompilationUnit )
 {
 }
@@ -316,6 +331,7 @@ void CompilationUnit::PushGlobalMembersToHeaderFile( GeneratedHeaderFile* Header
         if ( OwnerGenerator->IsDuplicateSymbolDefinition( SymbolName.OriginalFullName ) || SymbolName.bIsTemplateInstantiation )
         {
             std::wstring DuplicateDefinitionHeaderName = SymbolName.LocalName;
+            SanitizeGlobalMemberNameForHeaderFilename(DuplicateDefinitionHeaderName);
 
             // If we have a conflict with a manually overriden header filename, append Generated suffix to the header name
             if ( OwnerGenerator->IsHeaderFilenameOccupiedByManualHeader( DuplicateDefinitionHeaderName ) )
@@ -347,6 +363,7 @@ void CompilationUnit::PushGlobalMembersToHeaderFile( GeneratedHeaderFile* Header
         if ( OwnerGenerator->IsDuplicateSymbolDefinition( SymbolName.OriginalFullName ) || SymbolName.bIsTemplateInstantiation )
         {
             std::wstring DuplicateDefinitionHeaderName = SymbolName.LocalName;
+            SanitizeGlobalMemberNameForHeaderFilename(DuplicateDefinitionHeaderName);
 
             // If we have a conflict with a manually overriden header filename, append Generated suffix to the header name
             if ( OwnerGenerator->IsHeaderFilenameOccupiedByManualHeader( DuplicateDefinitionHeaderName ) )
@@ -518,16 +535,8 @@ void EnumerationInfo::AddCompilationUnitReference(const CompilationUnit* FromCom
 
 std::wstring EnumerationInfo::DetermineHeaderFilename() const
 {
-    std::wstring ResultHeaderFilename;
-    if ( CompilationUnitReferences.size() == 1 )
-    {
-        ResultHeaderFilename = (*CompilationUnitReferences.begin())->GetHeaderFilename();
-    }
-    else
-    {
-        const SymbolNameInfo SymbolInfo = SymbolNameInfo::FromSymbol( EnumerationSymbol );
-        ResultHeaderFilename = SymbolInfo.LocalName;
-    }
+    const SymbolNameInfo SymbolInfo = SymbolNameInfo::FromSymbol( EnumerationSymbol );
+    std::wstring ResultHeaderFilename = SymbolInfo.LocalName;
 
     // If we have a conflict with a manually overriden header filename, append Generated suffix to the header name
     if ( OwnerGenerator->IsHeaderFilenameOccupiedByManualHeader( ResultHeaderFilename ) )
@@ -660,6 +669,11 @@ void HeaderGenerator::LoadDataFromConfig(const HeaderGeneratorConfig& Config)
         {
             HeaderOverridenTypeNameToHeaderName.insert({ StringUtf8ToWide(ContainedTypeName), HeaderName });
         }
+    }
+
+    for ( const std::string& LibraryName : Config.LibrariesConsideredInternal )
+    {
+        LibrariesConsideredInternal.insert(StringUtf8ToWide(LibraryName));
     }
 
     for ( const TypeRemapDefinition& Definition : Config.TypeRemap )
@@ -1115,6 +1129,17 @@ const std::wstring* HeaderGenerator::FindExternalHeaderForType(const SymbolNameI
     return nullptr;
 }
 
+bool HeaderGenerator::IsHeaderFilenameOccupiedByManualHeader(const std::wstring& InHeaderFilename) const
+{
+    return HeaderOverrideNameToFilePath.find(InHeaderFilename) != HeaderOverrideNameToFilePath.end();
+}
+
+const std::wstring* HeaderGenerator::FindOverridenManualHeaderForType(const SymbolNameInfo& ClassName) const
+{
+    const auto Iterator = HeaderOverridenTypeNameToHeaderName.find(ClassName.ToString(SymbolNameInfo::IncludeNamespace));
+    return Iterator != HeaderOverridenTypeNameToHeaderName.end() ? &Iterator->second : nullptr;
+}
+
 UserDefinedTypeInfo* HeaderGenerator::FindOrAddUserDefinedType(const CComPtr<IDiaSymbol>& ClassSymbol)
 {
     // Strip any CV modifiers from the UDT type
@@ -1380,6 +1405,22 @@ std::shared_ptr<CompilationUnit> HeaderGenerator::CreateCompilationUnitForCompil
     // Either way, we are not very interested in .lib compilands other than keeping track of the linked libraries
     if ( Extension == L".lib" )
     {
+        // Certain libraries are treated as a part of the executable, even if they are compiled separately as static libraries
+        const std::wstring LibraryName = std::filesystem::path(LibraryFileName).replace_extension().wstring();
+        if ( LibrariesConsideredInternal.contains(LibraryName) )
+        {
+            // Generate a symbol name made up of both library name and object name
+            const std::wstring ObjectName = std::filesystem::path(LibraryFileName).replace_extension().wstring();
+            const std::wstring CombinedCompilationUnitName = StringPrintf(L"%s_%s", LibraryFileName.c_str(), ObjectName.c_str());
+
+            return std::make_shared<CompilationUnit>( this, CompilandSymbol, CombinedCompilationUnitName, false );
+        }
+        if ( !AlreadyPrintedLibraryNames.contains(LibraryName) )
+        {
+            AlreadyPrintedLibraryNames.insert(LibraryName);
+            std::wcout << L"Marking library as external: " << LibraryName << std::endl;
+        }
+
         // If symbol name ends with .dll, that means this lib is linking against a DLL. Otherwise, it's linking agaisnt an static library
         // DLLs will get two compilands: one with symbol name matching the DLL name and the other matching the DLL name + Import: prefix
         if ( SymbolName.ends_with(L".dll") )

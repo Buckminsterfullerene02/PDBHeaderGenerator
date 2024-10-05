@@ -372,7 +372,7 @@ std::shared_ptr<UDTDeclarationData> GeneratedHeaderFile::MakeUDT(const CComPtr<I
         FunctionDecl->bIsStatic = ObjectPointerType == nullptr; // we are static if we have no object pointer argument
         FunctionDecl->bIsVirtual = bIsFunctionVirtual;
         FunctionDecl->bIsPureVirtual = bIsFunctionPureVirtual;
-        if ( bIsFunctionVirtual )
+        if ( bIsFunctionVirtual && !bIsConstructorOrDestructor )
         {
             assert( !FunctionNameInfo.bIsTemplateInstantiation && L"templated virtual functions are definitely not a sane thing to support" );
 
@@ -491,7 +491,10 @@ std::shared_ptr<UDTDeclarationData> GeneratedHeaderFile::MakeUDT(const CComPtr<I
         const BOOL bIsDataConst = GET_SYMBOL_ATTRIBUTE_CHECKED( DataSymbol, constType );
         const CComPtr<IDiaSymbol> DataTypeSymbol = GET_SYMBOL_ATTRIBUTE_CHECKED( DataSymbol, type );
 
-        assert( DataLocationType == LocIsStatic || DataLocationType == LocIsThisRel || DataLocationType == LocIsBitField || DataLocationType == LocIsConstant );
+        assert( DataLocationType == LocIsStatic || DataLocationType == LocIsThisRel || DataLocationType == LocIsBitField || DataLocationType == LocIsConstant || DataLocationType == LocIsNull || DataLocationType == LocIsTLS );
+
+        // Skip members that do not have the location in the executable
+        if (DataLocationType == LocIsNull) continue;
 
         // Skip static data members that are not public symbols since they are not visible to the outside code
         if ( DataLocationType == LocIsStatic )
@@ -513,7 +516,8 @@ std::shared_ptr<UDTDeclarationData> GeneratedHeaderFile::MakeUDT(const CComPtr<I
         DataDecl->MemberType = CodeGeneration::FormatTypeName( DataTypeSymbol, TypeProvider );
         DataDecl->AccessModifier = CodeGeneration::ConvertAccessModifier( AccessModifier );
         DataDecl->bIsConst = bIsDataConst;
-        DataDecl->bIsStatic = DataLocationType == LocIsStatic || DataLocationType == LocIsConstant;
+        DataDecl->bIsStatic = DataLocationType == LocIsStatic || DataLocationType == LocIsConstant || DataLocationType == LocIsTLS;
+        DataDecl->bIsThreadLocal = DataLocationType == LocIsTLS;
 
         // Emit default initialization in case we emitted a no-op default constructor
         // We only need to do that for basic types and pointers, since they do not have default initializers.
@@ -584,6 +588,16 @@ std::shared_ptr<ITopLevelDeclaration> GeneratedHeaderFile::MakeTemplateDeclarati
         if ( Argument.Type == ETemplateArgumentType::TypeDeclaration )
         {
             DeclarationArgument.Type = ETemplateDeclarationArgumentType::Typename;
+        }
+        else if ( Argument.Type == ETemplateArgumentType::TypeMemberReference )
+        {
+            DeclarationArgument.Type = ETemplateDeclarationArgumentType::TypeValue;
+
+            // TODO: We do not have enough information to infer the type of the underlying template. void* will work on MSVC, since function pointers can be implicitly casted to void*,
+            // but will most likely not work on other platforms for member function pointer types and member pointer types
+            const std::shared_ptr<PointerTypeDeclaration> TypeKind = std::make_shared<PointerTypeDeclaration>();
+            TypeKind->PointeeType = std::make_shared<VoidTypeDeclaration>();
+            DeclarationArgument.TypeValueKind = TypeKind;
         }
         else if ( Argument.Type == ETemplateArgumentType::IntegerConst )
         {

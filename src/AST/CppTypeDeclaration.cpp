@@ -84,7 +84,7 @@ static const wchar_t* GetFixedLengthCstdintTypeName(const EBasicType InBasicType
 {
     switch (InBasicType)
     {
-        case EBasicType::FixedLengthInt8: return bIsUnsigned ? L"uint8_t" : L"int8_t";
+        case EBasicType::FixedLengthInt8: return bIsUnsigned ? L"char" : L"char";
         case EBasicType::FixedLengthInt16: return bIsUnsigned ? L"uint16_t" : L"int16_t";
         case EBasicType::FixedLengthInt32: return bIsUnsigned ? L"uint32_t" : L"int32_t";
         case EBasicType::FixedLengthInt64: return bIsUnsigned ? L"uint64_t" : L"int64_t";
@@ -168,6 +168,11 @@ size_t FundamentalTypeDeclaration::GetDeclarationHash() const
 void VoidTypeDeclaration::Print(FormattedTextWriter& TextWriter, const TypeFormattingRules& Rules) const
 {
     TextWriter.Append(L"void");
+    if (bIsConst)
+    {
+        TextWriter.Append(L" ");
+        TextWriter.Append(L" const");
+    }
 }
 
 bool VoidTypeDeclaration::Identical(const std::shared_ptr<ITypeDeclaration>& InOtherDeclaration) const
@@ -192,7 +197,9 @@ bool operator==(const TypeTemplateArgument& A, const TypeTemplateArgument& B)
     {
         case ETemplateArgumentType::IntegerConst: return A.IntegerConstant == B.IntegerConstant;
         case ETemplateArgumentType::TypeDeclaration: return ITypeDeclaration::StaticIdentical(A.TypeConstant, B.TypeConstant);
-        case ETemplateArgumentType::IntegerWildcard: return A.IntegerWildcardIndex == B.IntegerWildcardIndex;
+        case ETemplateArgumentType::TypeMemberReference: return A.TypeMemberReference == B.TypeMemberReference;
+        case ETemplateArgumentType::IntegerWildcard: return A.WildcardIndex == B.WildcardIndex;
+        case ETemplateArgumentType::TypeMemberReferenceWildcard: return A.WildcardIndex == B.WildcardIndex;
         default: assert(!L"Failed to compare unknown type template argument type"); return false;
     }
 }
@@ -207,9 +214,17 @@ bool TypeTemplateArgument::Match(const TypeTemplateArgument& InMatchAgainst, Typ
     {
         return ITypeDeclaration::StaticMatch( TypeConstant, InMatchAgainst.TypeConstant, MatchContext );
     }
+    if (Type == ETemplateArgumentType::TypeMemberReference && InMatchAgainst.Type == ETemplateArgumentType::TypeMemberReference)
+    {
+        return TypeMemberReference == InMatchAgainst.TypeMemberReference;
+    }
     if (Type == ETemplateArgumentType::IntegerWildcard && InMatchAgainst.Type == ETemplateArgumentType::IntegerConst)
     {
-        return MatchContext.MatchIntegerWildcard( IntegerWildcardIndex, InMatchAgainst.IntegerConstant );
+        return MatchContext.MatchIntegerWildcard( WildcardIndex, InMatchAgainst.IntegerConstant );
+    }
+    if (Type == ETemplateArgumentType::TypeMemberReferenceWildcard && InMatchAgainst.Type == ETemplateArgumentType::TypeMemberReference)
+    {
+        return MatchContext.MatchTypeMemberReferenceWildcard( WildcardIndex, InMatchAgainst.TypeMemberReference );
     }
     return false;
 }
@@ -224,9 +239,17 @@ void TypeTemplateArgument::Print(FormattedTextWriter& TextWriter, const TypeForm
     {
         TypeConstant->Print(TextWriter, Rules);
     }
+    else if (Type == ETemplateArgumentType::TypeMemberReference)
+    {
+        TypeMemberReference.Print(TextWriter, Rules);
+    }
     else if (Type == ETemplateArgumentType::IntegerWildcard)
     {
-        TextWriter.AppendFormat(L"??%d", IntegerWildcardIndex);
+        TextWriter.AppendFormat(L"??%d", WildcardIndex);
+    }
+    else if (Type == ETemplateArgumentType::TypeMemberReferenceWildcard)
+    {
+        TextWriter.AppendFormat(L"?&%d", WildcardIndex);
     }
     else
     {
@@ -250,11 +273,25 @@ TypeTemplateArgument TypeTemplateArgument::Substitute(const TypeDeclarationMatch
         Argument.TypeConstant = ITypeDeclaration::StaticSubstitute( TypeConstant, MatchContext );
         return Argument;
     }
+    if (Type == ETemplateArgumentType::TypeMemberReference)
+    {
+        TypeTemplateArgument Argument;
+        Argument.Type = ETemplateArgumentType::TypeMemberReference;
+        Argument.TypeMemberReference = TypeMemberReference.Substitute( MatchContext );
+        return Argument;
+    }
     if (Type == ETemplateArgumentType::IntegerWildcard)
     {
         TypeTemplateArgument Argument;
         Argument.Type = ETemplateArgumentType::IntegerConst;
-        Argument.IntegerConstant = MatchContext.SubstituteIntegerWildcard( IntegerWildcardIndex );
+        Argument.IntegerConstant = MatchContext.SubstituteIntegerWildcard( WildcardIndex );
+        return Argument;
+    }
+    if (Type == ETemplateArgumentType::TypeMemberReferenceWildcard)
+    {
+        TypeTemplateArgument Argument;
+        Argument.Type = ETemplateArgumentType::TypeMemberReference;
+        Argument.TypeMemberReference = MatchContext.SubstituteTypeMemberReferenceWildcard( WildcardIndex );
         return Argument;
     }
 
@@ -266,9 +303,13 @@ TypeTemplateArgument TypeTemplateArgument::Substitute(const TypeDeclarationMatch
 TypeTemplateArgument TypeTemplateArgument::Clone() const
 {
     TypeTemplateArgument ClonedArgument = *this;
-    if ( ClonedArgument.Type == ETemplateArgumentType::TypeDeclaration && ClonedArgument.TypeConstant )
+    if ( ClonedArgument.Type == ETemplateArgumentType::TypeDeclaration && TypeConstant )
     {
-        ClonedArgument.TypeConstant = ClonedArgument.TypeConstant->Clone();
+        ClonedArgument.TypeConstant = TypeConstant->Clone();
+    }
+    if ( ClonedArgument.Type == ETemplateArgumentType::TypeMemberReference )
+    {
+        ClonedArgument.TypeMemberReference = TypeMemberReference.Clone();
     }
     return ClonedArgument;
 }
@@ -278,8 +319,10 @@ size_t TypeTemplateArgument::GetTemplateArgumentHash() const
     switch (Type)
     {
         case ETemplateArgumentType::IntegerConst: return std::hash<int64_t>()( IntegerConstant );
-        case ETemplateArgumentType::TypeDeclaration: ITypeDeclaration::StaticGetDeclarationHash( TypeConstant );
-        case ETemplateArgumentType::IntegerWildcard: return std::hash<int64_t>()( IntegerWildcardIndex );
+        case ETemplateArgumentType::TypeDeclaration: return ITypeDeclaration::StaticGetDeclarationHash( TypeConstant );
+        case ETemplateArgumentType::TypeMemberReference: return TypeMemberReference.GetTypeMemberReferenceHash();
+        case ETemplateArgumentType::IntegerWildcard: return std::hash<int64_t>()( WildcardIndex );
+        case ETemplateArgumentType::TypeMemberReferenceWildcard: return std::hash<int64_t>()( WildcardIndex );
         default: assert(!L"Unknown type template argument type"); return 0;
     }
 }
@@ -629,6 +672,14 @@ void PointerTypeDeclaration::Print(FormattedTextWriter& TextWriter, const TypeFo
     // Print our pointee type first
     PointeeType->Print(TextWriter, Rules.InheritableFlags());
 
+    // If there is an owner type, this is a member function pointer, which precedes the pointer token
+    if ( OwnerType )
+    {
+        TextWriter.Append(L" ");
+        OwnerType->Print(TextWriter, Rules);
+        TextWriter.Append(L"::");
+    }
+
     // Print pointer or reference
     TextWriter.Append(bIsReference ? L"&" : L"*");
 
@@ -645,7 +696,8 @@ bool PointerTypeDeclaration::Identical(const std::shared_ptr<ITypeDeclaration>& 
     {
         const PointerTypeDeclaration& Other = static_cast<PointerTypeDeclaration&>(*InOtherDeclaration);
         return bIsConst == Other.bIsConst && bIsReference == Other.bIsReference &&
-            StaticIdentical( PointeeType, Other.PointeeType );
+            StaticIdentical( PointeeType, Other.PointeeType ) &&
+            StaticIdentical( OwnerType, Other.OwnerType );
     }
     return false;
 }
@@ -657,7 +709,8 @@ bool PointerTypeDeclaration::Match(const std::shared_ptr<ITypeDeclaration>& InMa
         const PointerTypeDeclaration& Other = static_cast<PointerTypeDeclaration&>(*InMatchAgainst);
         return bIsConst == Other.bIsConst &&
             bIsReference == Other.bIsReference &&
-            StaticMatch( PointeeType, Other.PointeeType, MatchContext );
+            StaticMatch( PointeeType, Other.PointeeType, MatchContext ) &&
+            StaticMatch( OwnerType, Other.OwnerType, MatchContext );
     }
     return false;
 }
@@ -666,6 +719,7 @@ std::shared_ptr<ITypeDeclaration> PointerTypeDeclaration::Substitute(const TypeD
 {
     std::shared_ptr<PointerTypeDeclaration> PointerType = std::make_shared<PointerTypeDeclaration>( *this );
     PointerType->PointeeType = StaticSubstitute( PointeeType, MatchContext );
+    PointerType->OwnerType = StaticSubstitute( OwnerType, MatchContext );
     return PointerType;
 }
 
@@ -680,6 +734,7 @@ size_t PointerTypeDeclaration::GetDeclarationHash() const
     HashCombine( PointeeHash, GetId() );
     HashCombine( PointeeHash, bIsConst );
     HashCombine( PointeeHash, bIsReference );
+    HashCombine( PointeeHash, StaticGetDeclarationHash( OwnerType ) );
     return PointeeHash;
 }
 
@@ -982,6 +1037,58 @@ int64_t TypeDeclarationMatchContext::SubstituteIntegerWildcard(const int32_t InW
     return IntegerWildcardMatches.find( InWildcardIndex )->second;
 }
 
+TypeMemberReference TypeDeclarationMatchContext::SubstituteTypeMemberReferenceWildcard(int32_t InWildcardIndex) const
+{
+    return TypeMemberReferenceWildcardMatches.find( InWildcardIndex )->second;
+}
+
+bool operator==(const TypeMemberReference& A, const TypeMemberReference& B)
+{
+    return ITypeDeclaration::StaticIdentical(A.OwnerType, B.OwnerType) && A.MemberName == B.MemberName;
+}
+
+bool TypeMemberReference::Match(const TypeMemberReference& InMatchAgainst, TypeDeclarationMatchContext& MatchContext) const
+{
+    // Allow partial matching of owner types with wildcards, but member names have to fully match
+    return ITypeDeclaration::StaticMatch(OwnerType, InMatchAgainst.OwnerType, MatchContext) && MemberName == InMatchAgainst.MemberName;
+}
+
+void TypeMemberReference::Print(FormattedTextWriter& TextWriter, const TypeFormattingRules& Rules) const
+{
+    if (OwnerType)
+    {
+        OwnerType->Print(TextWriter, Rules);
+    }
+    TextWriter.Append(L"::");
+    TextWriter.Append(MemberName);
+}
+
+TypeMemberReference TypeMemberReference::Substitute(const TypeDeclarationMatchContext& MatchContext) const
+{
+    // Allow partial matching of owner types with wildcards, but member names have to fully match
+    TypeMemberReference NewMemberReference;
+    NewMemberReference.OwnerType = ITypeDeclaration::StaticSubstitute(OwnerType, MatchContext);
+    NewMemberReference.MemberName = MemberName;
+
+    return NewMemberReference;
+}
+
+TypeMemberReference TypeMemberReference::Clone() const
+{
+    TypeMemberReference NewMemberReference;
+    NewMemberReference.OwnerType = OwnerType ? OwnerType->Clone() : nullptr;
+    NewMemberReference.MemberName = MemberName;
+
+    return NewMemberReference;
+}
+
+size_t TypeMemberReference::GetTypeMemberReferenceHash() const
+{
+    size_t MemberReferenceHash = ITypeDeclaration::StaticGetDeclarationHash(OwnerType);
+    HashCombine(MemberReferenceHash, MemberName);
+    return MemberReferenceHash;
+}
+
 bool ITypeDeclaration::StaticIdentical(const std::shared_ptr<ITypeDeclaration>& A, const std::shared_ptr<ITypeDeclaration>& B)
 {
     return A == B || ( A != nullptr && B != nullptr && A->GetId() == B->GetId() && A->Identical(B) );
@@ -1021,6 +1128,16 @@ bool TypeDeclarationMatchContext::MatchIntegerWildcard(int32_t InWildcardIndex, 
     return true;
 }
 
+bool TypeDeclarationMatchContext::MatchTypeMemberReferenceWildcard(int32_t InWildcardIndex, const TypeMemberReference& InTypeMemberReference)
+{
+    if ( const auto Iterator = TypeMemberReferenceWildcardMatches.find(InWildcardIndex); Iterator != TypeMemberReferenceWildcardMatches.end() )
+    {
+        return InTypeMemberReference == Iterator->second;
+    }
+    TypeMemberReferenceWildcardMatches.insert({ InWildcardIndex, InTypeMemberReference });
+    return true;
+}
+
 bool ITypeDeclaration::Match(const std::shared_ptr<ITypeDeclaration>& InMatchAgainst, TypeDeclarationMatchContext& MatchContext) const
 {
     // By default, match matches the behavior of Identical
@@ -1050,7 +1167,7 @@ bool FTypeTextParseHelper::ParseTemplateArgumentsInternal( std::vector<TypeTempl
     while (true)
     {
         // Stop parsing template arguments if it's end of line or is a template bracket
-        const TypeTextToken CurrentToken = PeekNextToken();
+        TypeTextToken CurrentToken = PeekNextToken();
         if ( CurrentToken.Type == ETypeTextToken::EndOfLine || CurrentToken.Type == ETypeTextToken::TemplateRBracket )
         {
             return true;
@@ -1087,14 +1204,30 @@ bool FTypeTextParseHelper::ParseTemplateArgumentsInternal( std::vector<TypeTempl
 
             TypeTemplateArgument TemplateArgument;
             TemplateArgument.Type = ETemplateArgumentType::IntegerWildcard;
-            TemplateArgument.IntegerWildcardIndex = ArgumentFirstToken.WildcardIndex;
+            TemplateArgument.WildcardIndex = ArgumentFirstToken.WildcardIndex;
             OutTemplateArguments.push_back(TemplateArgument);
         }
-        // Check for reference, that would parse as a member function pointer
+        // Check for type member reference wildcard, if we are allowed to parse wildcards
+        else if ( ArgumentFirstToken.Type == ETypeTextToken::TypeMemberReferenceWildcard && bAllowWildcards )
+        {
+            ConsumeNextToken();
+
+            TypeTemplateArgument TemplateArgument;
+            TemplateArgument.Type = ETemplateArgumentType::TypeMemberReferenceWildcard;
+            TemplateArgument.WildcardIndex = ArgumentFirstToken.WildcardIndex;
+            OutTemplateArguments.push_back(TemplateArgument);
+        }
+        // Check for reference, that would parse as a function/data pointer
         else if ( ArgumentFirstToken.Type == ETypeTextToken::Reference )
         {
-            assert(!L"Data/function pointer as a template instantiation argument is not supported (yet). If you assert here, please poke me to add parsing of these");
-            return false;
+            ConsumeNextToken();
+
+            const TypeMemberReference TypeMemberReference = ParseTypeMemberReference();
+
+            TypeTemplateArgument TemplateArgument;
+            TemplateArgument.Type = ETemplateArgumentType::TypeMemberReference;
+            TemplateArgument.TypeMemberReference = TypeMemberReference;
+            OutTemplateArguments.push_back(TemplateArgument);
         }
         // This must be a type declaration otherwise
         else
@@ -1113,6 +1246,100 @@ bool FTypeTextParseHelper::ParseTemplateArgumentsInternal( std::vector<TypeTempl
             OutTemplateArguments.push_back(TemplateArgument);
         }
     }
+}
+
+TypeMemberReference FTypeTextParseHelper::ParseTypeMemberReference()
+{
+    // A more narrow subset of C++ syntax is allowed here compared to ParseSimpleTypeDeclaration. For example,
+    // no CSU specifiers are allowed, and no base types are allowed at any point. It must be a sequence of identifiers, potentially with template arguments
+    TypeTextToken CurrentToken = PeekNextToken();
+
+    std::shared_ptr<UDTTypeDeclaration> CurrentOuterType = nullptr;
+    std::vector<std::wstring_view> NamespaceTypeNameAndMemberNameSegments;
+
+    // Parses currently buffered segment tokens into the current outer type
+    const auto ParseBufferedSegmentsIntoTypeDeclarations = [&](const TypeTemplateArgumentContainer& TemplateArguments, const int32_t EndOffset = 0)
+    {
+        assert(!NamespaceTypeNameAndMemberNameSegments.empty() && L"Expected identifier when parsing member/data pointer, got nothing");
+
+        // This is the first type we are parsing, assume all parts before the last token are namespace, and last token is the type name
+        if ( CurrentOuterType == nullptr )
+        {
+            CurrentOuterType = std::make_shared<UDTTypeDeclaration>();
+            const std::span NamespaceSpan{NamespaceTypeNameAndMemberNameSegments.data(), NamespaceTypeNameAndMemberNameSegments.size() - EndOffset - 1};
+
+            // Initialize first chunk as the namespace and last segment as the class name, and append arguments
+            CurrentOuterType->OuterScope = JoinToString(NamespaceSpan, L"::");
+            CurrentOuterType->ClassName = NamespaceTypeNameAndMemberNameSegments[NamespaceTypeNameAndMemberNameSegments.size() - EndOffset - 1];
+            CurrentOuterType->TemplateArguments = TemplateArguments;
+        }
+        // This is a nested type. That implies that each segment represents a nested type, and never a namespace
+        else
+        {
+            for ( int32_t i = 0; i < NamespaceTypeNameAndMemberNameSegments.size() - EndOffset; i++ )
+            {
+                const std::shared_ptr<UDTTypeDeclaration> NewNestedType = std::make_shared<UDTTypeDeclaration>();
+
+                NewNestedType->OuterType = CurrentOuterType;
+                NewNestedType->ClassName = NamespaceTypeNameAndMemberNameSegments[i];
+                NewNestedType->TemplateArguments = TemplateArguments;
+                CurrentOuterType = NewNestedType;
+            }
+        }
+        NamespaceTypeNameAndMemberNameSegments.erase(NamespaceTypeNameAndMemberNameSegments.begin(), NamespaceTypeNameAndMemberNameSegments.end() - EndOffset);
+    };
+
+    // Consume identifiers until we run out of them
+    while ( CurrentToken.Type == ETypeTextToken::Identifier )
+    {
+        // Consume the current identifier token
+        NamespaceTypeNameAndMemberNameSegments.push_back(CurrentToken.Identifier);
+        ConsumeNextToken();
+        CurrentToken = PeekNextToken();
+
+        // If we have parsed a template opening bracket, consume it, parse template arguments and consume closing bracket
+        if ( CurrentToken.Type == ETypeTextToken::TemplateLBracket )
+        {
+            ConsumeNextToken();
+            TypeTemplateArgumentContainer TemplateArguments;
+            const bool bParsedTemplateArguments = ParseTemplateArgumentsInternal(TemplateArguments.Arguments);
+
+            assert(bParsedTemplateArguments && L"Failed to parse template arguments when parsing member/data pointer");
+
+            CurrentToken = PeekNextToken();
+            assert(CurrentToken.Type == ETypeTextToken::TemplateRBracket && L"Expected > when parsing member/data pointer, got another token");
+            ConsumeNextToken();
+
+            // Form a type name from the already assembled tokens
+            ParseBufferedSegmentsIntoTypeDeclarations(TemplateArguments, 0);
+            CurrentToken = PeekNextToken();
+        }
+
+        // If this is not a scope delimiter, break out of the loop
+        if ( CurrentToken.Type != ETypeTextToken::ScopeDelimiter )
+        {
+            break;
+        }
+        ConsumeNextToken();
+        CurrentToken = PeekNextToken();
+    }
+
+    // If there are any additional tokens buffered, consume them to make a new type (but leave the last token)
+    if ( NamespaceTypeNameAndMemberNameSegments.size() > 1 )
+    {
+        ParseBufferedSegmentsIntoTypeDeclarations(TypeTemplateArgumentContainer{}, 1);
+    }
+
+    // Make sure we have a valid outer type now and one token for the member name
+    assert(CurrentOuterType != nullptr && L"Expected typename preceding member name when parsing member/data pointer");
+    assert(NamespaceTypeNameAndMemberNameSegments.size() == 1 && L"Expected member name when parsing member/data pointer");
+    const std::wstring_view MemberName = NamespaceTypeNameAndMemberNameSegments[0];
+
+    TypeMemberReference ResultMemberReference;
+    ResultMemberReference.OwnerType = CurrentOuterType;
+    ResultMemberReference.MemberName = MemberName;
+
+    return ResultMemberReference;
 }
 
 std::shared_ptr<ITypeDeclaration> FTypeTextParseHelper::ParseCompleteTypeDeclaration()
@@ -1177,11 +1404,8 @@ std::shared_ptr<ITypeDeclaration> FTypeTextParseHelper::ParseCompleteTypeDeclara
             return CurrentType;
         }
         // Parse function signature type, or dumb type ordering rules
-        else if ( NextTypeToken.Type == ETypeTextToken::LBracket )
+        else if ( NextTypeToken.Type == ETypeTextToken::LBracket || NextTypeToken.Type == ETypeTextToken::CallingConvention )
         {
-            ConsumeNextToken();
-            NextTypeToken = PeekNextToken();
-
             const std::shared_ptr<ITypeDeclaration> FunctionTypeDeclaration = ParseFunctionPointerDeclaration( CurrentType );
             if ( FunctionTypeDeclaration == nullptr )
             {
@@ -1189,6 +1413,38 @@ std::shared_ptr<ITypeDeclaration> FTypeTextParseHelper::ParseCompleteTypeDeclara
                 return nullptr;
             }
             return FunctionTypeDeclaration;
+        }
+        // This could be a declaration of the pointer to member type, or a part that is unrelated to this type. We need to parse it to be able to tell for sure
+        else if ( NextTypeToken.Type == ETypeTextToken::Identifier )
+        {
+            FTypeTextParseHelper ForkedTypeParser = *this;
+            const std::shared_ptr<ITypeDeclaration> PotentialOuterTypeIdentifier = ForkedTypeParser.ParseSimpleTypeDeclaration();
+            const TypeTextToken PotentialScopeDelimiterToken = ForkedTypeParser.ConsumeNextToken();
+            const TypeTextToken PotentialPointerToken = ForkedTypeParser.ConsumeNextToken();
+
+            if ( PotentialOuterTypeIdentifier && PotentialScopeDelimiterToken.Type == ETypeTextToken::ScopeDelimiter && PotentialPointerToken.Type == ETypeTextToken::Pointer )
+            {
+                // Consume all the tokens we digested
+                ParseSimpleTypeDeclaration();
+                ConsumeNextToken();
+                ConsumeNextToken();
+
+                // Construct and initialize the pointer to member type declaration
+                const std::shared_ptr<PointerTypeDeclaration> MemberPointerTypeDeclaration = std::make_shared<PointerTypeDeclaration>();
+
+                MemberPointerTypeDeclaration->PointeeType = CurrentType;
+                MemberPointerTypeDeclaration->OwnerType = PotentialOuterTypeIdentifier;
+                MemberPointerTypeDeclaration->bIsReference = false;
+
+                // This could be a multi-layer pointer type, e.g. pointer to a pointer to a pointer to member, so we keep parsing from this point on
+                // in case we encounter additional type declaration details later on
+                CurrentType = MemberPointerTypeDeclaration;
+            }
+            else
+            {
+                // If this is not a pointer to member type, we are done parsing this type declaration
+                return CurrentType;
+            }
         }
         // Any other token we are not aware of, return the current type
         else
@@ -1206,33 +1462,64 @@ std::shared_ptr<ITypeDeclaration> FTypeTextParseHelper::ParseFunctionPointerDecl
     std::optional<ECallingConvention> CallingConvention;
     bool bIsFunctionTypeConst = false;
     bool bIsPotentiallyPointerOrReferenceToArray = true;
+    bool bIsFunctionPointerType = false;
 
-    // If this is an identifier (or a global namespace scope delimiter), we are parsing a member function pointer type
-    if ( NextTypeToken.Type == ETypeTextToken::Identifier || NextTypeToken.Type == ETypeTextToken::ScopeDelimiter )
-    {
-        OuterTypeIdentifier = ParseSimpleTypeDeclaration();
-        if ( !OuterTypeIdentifier )
-        {
-            assert(!L"Failed to parse member function owner class typename when parsing member function pointer declaration");
-            return nullptr;
-        }
-        NextTypeToken = PeekNextToken();
-
-        // Next token should be a scope delimiter following the type and separating it from function pointer
-        if ( NextTypeToken.Type != ETypeTextToken::ScopeDelimiter )
-        {
-            assert(!L"Expected ::, got another token when parsing member function pointer class name");
-            return nullptr;
-        }
+    // Attempt to parse a calling convention if it is the first token encountered after the return type
+    if ( NextTypeToken.Type == ETypeTextToken::CallingConvention ) {
         ConsumeNextToken();
+        CallingConvention = NextTypeToken.CallingConvention;
         NextTypeToken = PeekNextToken();
-        // Member function pointer syntax definitely cannot be parsed as reference to array
+        // If we found a calling convention, this is not a reference to array
         bIsPotentiallyPointerOrReferenceToArray = false;
     }
 
+    // We should always expect the first token to be an opening bracket, either for argument list or for member function declaration
+    assert(NextTypeToken.Type == ETypeTextToken::LBracket && L"Expected ( following the function return type declaration, got a different token");
+    ConsumeNextToken();
+    NextTypeToken = PeekNextToken();
+
+    // Attempt to parse a calling convention if it is the first token encountered after the argument list. In that case, this is definitely a function pointer declaration
+    if ( NextTypeToken.Type == ETypeTextToken::CallingConvention && !CallingConvention.has_value() ) {
+        ConsumeNextToken();
+        CallingConvention = NextTypeToken.CallingConvention;
+        NextTypeToken = PeekNextToken();
+        // If we found a calling convention, this is not a reference to array
+        bIsPotentiallyPointerOrReferenceToArray = false;
+        bIsFunctionPointerType = true;
+    }
+
+    // If this is an identifier (or a global namespace scope delimiter), we are parsing a member function pointer type
+    if ( NextTypeToken.Type == ETypeTextToken::Identifier || NextTypeToken.Type == ETypeTextToken::ScopeDelimiter ) {
+
+        // This can end up being a type of the first argument if we are parsing the argument list and not the member function pointer declaration,
+        // so attempt to parse the type separately first and only commit if we succeeded
+        FTypeTextParseHelper ForkedTypeParser = *this;
+        const std::shared_ptr<ITypeDeclaration> PotentialOuterTypeIdentifier = ForkedTypeParser.ParseSimpleTypeDeclaration();
+        const TypeTextToken PotentialNextToken = ForkedTypeParser.PeekNextToken();
+
+        // If this is an actual member function pointer declaration, next type token should always be a scope delimiter
+        // delimiting the outer type from the function pointer declaration. If it is not, we are parsing an argument list instead, and should discard our partial parsing results
+        if ( PotentialOuterTypeIdentifier && PotentialNextToken.Type == ETypeTextToken::ScopeDelimiter ) {
+
+            // Consume all the tokens that we speculatively consumed before
+            ParseSimpleTypeDeclaration();
+            NextTypeToken = PotentialNextToken;
+            OuterTypeIdentifier = PotentialOuterTypeIdentifier;
+
+            // Next token should be a scope delimiter following the type and separating it from function pointer
+            if (NextTypeToken.Type != ETypeTextToken::ScopeDelimiter) {
+                assert(!L"Expected ::, got another token when parsing member function pointer class name");
+                return nullptr;
+            }
+            ConsumeNextToken();
+            NextTypeToken = PeekNextToken();
+            // Member function pointer syntax definitely cannot be parsed as reference to array
+            bIsPotentiallyPointerOrReferenceToArray = false;
+        }
+    }
+
     // Potentially parse calling convention in case we did not parse a outer type
-    if ( OuterTypeIdentifier == nullptr && NextTypeToken.Type == ETypeTextToken::CallingConvention )
-    {
+    if (OuterTypeIdentifier == nullptr && NextTypeToken.Type == ETypeTextToken::CallingConvention && !CallingConvention.has_value()) {
         ConsumeNextToken();
         CallingConvention = NextTypeToken.CallingConvention;
         NextTypeToken = PeekNextToken();
@@ -1241,102 +1528,111 @@ std::shared_ptr<ITypeDeclaration> FTypeTextParseHelper::ParseFunctionPointerDecl
     }
 
     // Potentially consume out-of-order const modifier that would be applied to the pointer
-    if ( NextTypeToken.Type == ETypeTextToken::TypeModifier && NextTypeToken.TypeModifier == ETypeModifier::Const )
-    {
+    if (NextTypeToken.Type == ETypeTextToken::TypeModifier && NextTypeToken.TypeModifier == ETypeModifier::Const) {
         ConsumeNextToken();
         bIsFunctionTypeConst = true;
         NextTypeToken = PeekNextToken();
     }
 
-    // Next token should be a function pointer type (or reference)
-    // Reference is only valid if this function declaration can be parsed as pointer to array
-    if ( NextTypeToken.Type != ETypeTextToken::Pointer && !(NextTypeToken.Type == ETypeTextToken::Reference && bIsPotentiallyPointerOrReferenceToArray) )
+    // If the next token is not a pointer or reference, this is a function type declaration and not a function pointer declaration
+    // In that case we do not need to parse second layer of the calling convention and const-ness of the function pointer, but can skip directly to the argument list
+    // Note that this declaration syntax is only valid for global function prototypes, and as such cannot be used if we already parsed an outer type
+    // We also have to parse the function pointer if we already parsed it being marked with const modifier
+    // We also have to treat this as a member function pointer declaration if we encountered a calling convention declaration inside the argument list
+    if ( NextTypeToken.Type == ETypeTextToken::Pointer || NextTypeToken.Type == ETypeTextToken::Reference || OuterTypeIdentifier != nullptr || bIsFunctionTypeConst || bIsFunctionPointerType )
     {
-        assert(!L"Expected pointer type in the function pointer declaration, got another token");
-        return nullptr;
-    }
-    const bool bParsedReferenceInsteadOfPointer = NextTypeToken.Type == ETypeTextToken::Reference;
-    ConsumeNextToken();
-    NextTypeToken = PeekNextToken();
-
-    // Potentially consume calling convention if we have not done so before
-    // We cannot parse calling convention if we parsed reference instead of a pointer
-    if ( NextTypeToken.Type == ETypeTextToken::CallingConvention && !CallingConvention.has_value() && !bParsedReferenceInsteadOfPointer )
-    {
-        ConsumeNextToken();
-        CallingConvention = NextTypeToken.CallingConvention;
-        NextTypeToken = PeekNextToken();
-        // If we found a calling convention, this is not an reference to array
-        bIsPotentiallyPointerOrReferenceToArray = false;
-    }
-
-    // And also potentially consume const modifier
-    if ( NextTypeToken.Type == ETypeTextToken::TypeModifier && NextTypeToken.TypeModifier == ETypeModifier::Const && !bIsFunctionTypeConst )
-    {
-        ConsumeNextToken();
-        bIsFunctionTypeConst = true;
-        NextTypeToken = PeekNextToken();
-    }
-
-    // Next token should be a closing bracket for pointer declaration
-    if ( NextTypeToken.Type != ETypeTextToken::RBracket )
-    {
-        assert(!L"Expected ) closing the function pointer declaration, got another token");
-        return nullptr;
-    }
-    ConsumeNextToken();
-    NextTypeToken = PeekNextToken();
-
-    // Check if this is actually a pointer/reference to array declaration. In that case, next symbol would be an array left bracket, followed by optional dimension and closing bracket
-    // After that, we consider the type declaration complete, and nothing past it is parsed
-    if ( NextTypeToken.Type == ETypeTextToken::ArrayLBracket && bIsPotentiallyPointerOrReferenceToArray )
-    {
+        // Next token should be a function pointer type (or reference)
+        // Reference is only valid if this function declaration can be parsed as pointer to array
+        if ( NextTypeToken.Type != ETypeTextToken::Pointer && !(NextTypeToken.Type == ETypeTextToken::Reference && bIsPotentiallyPointerOrReferenceToArray) )
+        {
+            assert(!L"Expected pointer type in the function pointer declaration, got another token");
+            return nullptr;
+        }
+        const bool bParsedReferenceInsteadOfPointer = NextTypeToken.Type == ETypeTextToken::Reference;
         ConsumeNextToken();
         NextTypeToken = PeekNextToken();
+        bIsFunctionPointerType = true;
 
-        // Potentially digest the static array dimensions
-        std::optional<int32_t> StaticArrayDimension;
-        if ( NextTypeToken.Type == ETypeTextToken::Integer )
+        // Potentially consume calling convention if we have not done so before
+        // We cannot parse calling convention if we parsed reference instead of a pointer
+        if ( NextTypeToken.Type == ETypeTextToken::CallingConvention && !CallingConvention.has_value() && !bParsedReferenceInsteadOfPointer )
         {
             ConsumeNextToken();
-            StaticArrayDimension = NextTypeToken.IntegerValue;
+            CallingConvention = NextTypeToken.CallingConvention;
+            NextTypeToken = PeekNextToken();
+            // If we found a calling convention, this is not a reference to array
+            bIsPotentiallyPointerOrReferenceToArray = false;
+        }
+
+        // And also potentially consume const modifier
+        if ( NextTypeToken.Type == ETypeTextToken::TypeModifier && NextTypeToken.TypeModifier == ETypeModifier::Const && !bIsFunctionTypeConst )
+        {
+            ConsumeNextToken();
+            bIsFunctionTypeConst = true;
             NextTypeToken = PeekNextToken();
         }
 
-        // Last token we parse should be a closing bracket of the array
-        if ( NextTypeToken.Type != ETypeTextToken::ArrayRBracket )
+        // Next token should be a closing bracket for pointer declaration
+        if ( NextTypeToken.Type != ETypeTextToken::RBracket )
         {
-            assert(!L"Expected ] following the array size declaration, got another token");
+            assert(!L"Expected ) closing the function pointer declaration, got another token");
             return nullptr;
         }
         ConsumeNextToken();
         NextTypeToken = PeekNextToken();
 
-        const std::shared_ptr<ArrayTypeDeclaration> ArrayType = std::make_shared<ArrayTypeDeclaration>();
-        ArrayType->ElementType = ReturnType;
-        ArrayType->ArrayDimension = StaticArrayDimension;
+        // Check if this is actually a pointer/reference to array declaration. In that case, next symbol would be an array left bracket, followed by optional dimension and closing bracket
+        // After that, we consider the type declaration complete, and nothing past it is parsed
+        if ( NextTypeToken.Type == ETypeTextToken::ArrayLBracket && bIsPotentiallyPointerOrReferenceToArray )
+        {
+            ConsumeNextToken();
+            NextTypeToken = PeekNextToken();
 
-        const std::shared_ptr<PointerTypeDeclaration> PointerType = std::make_shared<PointerTypeDeclaration>();
-        PointerType->PointeeType = ArrayType;
-        PointerType->bIsConst = bIsFunctionTypeConst;
-        PointerType->bIsReference = bParsedReferenceInsteadOfPointer;
-        return PointerType;
-    }
+            // Potentially digest the static array dimensions
+            std::optional<int32_t> StaticArrayDimension;
+            if ( NextTypeToken.Type == ETypeTextToken::Integer )
+            {
+                ConsumeNextToken();
+                StaticArrayDimension = NextTypeToken.IntegerValue;
+                NextTypeToken = PeekNextToken();
+            }
 
-    // Next should be an opening bracket for the argument list
-    if ( NextTypeToken.Type != ETypeTextToken::LBracket )
-    {
-        assert(!L"Expected ( preceding the function pointer argument list declaration, got another token");
-        return nullptr;
-    }
-    ConsumeNextToken();
-    NextTypeToken = PeekNextToken();
+            // Last token we parse should be a closing bracket of the array
+            if ( NextTypeToken.Type != ETypeTextToken::ArrayRBracket )
+            {
+                assert(!L"Expected ] following the array size declaration, got another token");
+                return nullptr;
+            }
+            ConsumeNextToken();
+            NextTypeToken = PeekNextToken();
 
-    // Make sure we did not parse a reference instead of a pointer, now that we know this is a function pointer declaration and not a reference to array
-    if ( bParsedReferenceInsteadOfPointer )
-    {
-        assert(!L"Expected * when parsing function pointer declaration, but got & instead");
-        return nullptr;
+            const std::shared_ptr<ArrayTypeDeclaration> ArrayType = std::make_shared<ArrayTypeDeclaration>();
+            ArrayType->ElementType = ReturnType;
+            ArrayType->ArrayDimension = StaticArrayDimension;
+
+            const std::shared_ptr<PointerTypeDeclaration> PointerType = std::make_shared<PointerTypeDeclaration>();
+            PointerType->PointeeType = ArrayType;
+            PointerType->bIsConst = bIsFunctionTypeConst;
+            PointerType->bIsReference = bParsedReferenceInsteadOfPointer;
+            return PointerType;
+        }
+
+        // Next should be an opening bracket for the argument list
+        if ( NextTypeToken.Type != ETypeTextToken::LBracket )
+        {
+            assert(!L"Expected ( preceding the function pointer argument list declaration, got another token");
+            return nullptr;
+        }
+
+        ConsumeNextToken();
+        NextTypeToken = PeekNextToken();
+
+        // Make sure we did not parse a reference instead of a pointer, now that we know this is a function pointer declaration and not a reference to array
+        if ( bParsedReferenceInsteadOfPointer )
+        {
+            assert(!L"Expected * when parsing function pointer declaration, but got & instead");
+            return nullptr;
+        }
     }
 
     // Parse function argument list
@@ -1404,7 +1700,7 @@ std::shared_ptr<ITypeDeclaration> FTypeTextParseHelper::ParseFunctionPointerDecl
     const std::shared_ptr<FunctionTypeDeclaration> FunctionType = std::make_shared<FunctionTypeDeclaration>();
     FunctionType->Arguments = FunctionArguments;
     FunctionType->ReturnType = ReturnType;
-    FunctionType->bIsFunctionPointer = true;
+    FunctionType->bIsFunctionPointer = bIsFunctionPointerType;
     FunctionType->OwnerType = OuterTypeIdentifier;
     FunctionType->bIsConstMemberFunction = bIsConstMemberFunction;
     FunctionType->bIsVariadicArguments = bIsVariadicArguments;
@@ -1474,6 +1770,12 @@ std::shared_ptr<ITypeDeclaration> FTypeTextParseHelper::ParsePartialSimpleDeclar
         assert(!L"Expected identifier for type name, got different token");
         return nullptr;
     }
+    // Check if the next token is a scope separator followed by the internal type. In that case, it's an internal type inside the specific scope
+    else if ( PeekNextToken().Type == ETypeTextToken::ScopeDelimiter && PeekNextNextToken().Type == ETypeTextToken::InternalIdentifier )
+    {
+        ConsumeNextToken();
+        InternalTypeToken = ConsumeNextToken();
+    }
 
     // Convert std::nullptr_t into FundamentalType nullptr because it is 3 tokens that cannot be easily digested in the tokenizer as one
     if ( OuterType == nullptr && (OuterScope.empty() || OuterScope == L"std") && TypeName == L"nullptr_t" )
@@ -1522,7 +1824,7 @@ std::shared_ptr<ITypeDeclaration> FTypeTextParseHelper::ParsePartialSimpleDeclar
         }
         if ( InternalTypeToken.has_value() )
         {
-            assert(!L"Enocuntered template instantiation after an internal type. Internal types cannot be templated.");
+            assert(!L"Encountered template instantiation after an internal type. Internal types cannot be templated.");
             return nullptr;
         }
         ConsumeNextToken();
@@ -1554,7 +1856,7 @@ std::shared_ptr<ITypeDeclaration> FTypeTextParseHelper::ParsePartialSimpleDeclar
         return nullptr;
     }
 
-    // Check against predeclaration of nested types. Nested types cannot be pre-declared
+    // Check against pre-declaration of nested types. Nested types cannot be pre-declared
     if ( ( bHasEnumSpecifier || CSUSpecifier.has_value() ) && OuterType != nullptr )
     {
         assert(!L"Nested types or enumerations cannot be predeclared, and as such cannot have an CSU specifier or an Enum specifier");
@@ -1570,16 +1872,10 @@ std::shared_ptr<ITypeDeclaration> FTypeTextParseHelper::ParsePartialSimpleDeclar
         ConsumeNextToken();
 
         std::shared_ptr<ITypeDeclaration> ResultOuterType;
-        if ( InternalTypeToken.has_value() )
-        {
-            const std::shared_ptr<InternalTypeDeclaration> OuterInternalType = std::make_shared<InternalTypeDeclaration>();
-            OuterInternalType->OuterType = OuterType;
-            OuterInternalType->Identifier = InternalTypeToken->InternalIdentifier;
-            OuterInternalType->InternalTypeName = InternalTypeToken->UnnamedEnumOrTypeVariableName;
-            OuterInternalType->LambdaIndex = InternalTypeToken->LambdaIndex;
-            ResultOuterType = OuterInternalType;
-        }
-        else
+
+        // If we do not have an internal type token parsed, this is a user defined type. However, even if we have internal type parsed, it can still be prefixed with a type name,
+        // which would always represent a parent UDT type that we should parse. In that case, we should never have template arguments though
+        if ( !InternalTypeToken.has_value() || !TypeName.empty() )
         {
             // We do not have complete information about this type. For example, we do not know the CSU specifier for this type
             // But the information we have is enough to construct a nested type with optional CV modifiers and CSU/enum specifier
@@ -1590,6 +1886,19 @@ std::shared_ptr<ITypeDeclaration> FTypeTextParseHelper::ParsePartialSimpleDeclar
             OuterUDTType->ClassName = TypeName;
             OuterUDTType->TemplateArguments.Arguments = TemplateArguments;
             ResultOuterType = OuterUDTType;
+        }
+
+        // Parse internal type token if there is one
+        if ( InternalTypeToken.has_value() )
+        {
+            assert(TemplateArguments.empty() && L"Internal type declarations cannot have any template arguments");
+
+            const std::shared_ptr<InternalTypeDeclaration> OuterInternalType = std::make_shared<InternalTypeDeclaration>();
+            OuterInternalType->OuterType = OuterType;
+            OuterInternalType->Identifier = InternalTypeToken->InternalIdentifier;
+            OuterInternalType->InternalTypeName = InternalTypeToken->UnnamedEnumOrTypeVariableName;
+            OuterInternalType->LambdaIndex = InternalTypeToken->LambdaIndex;
+            ResultOuterType = OuterInternalType;
         }
 
         // Pass applied modifiers and CSU/enum specifiers to the child class, since they are applied to it and not to the parent
@@ -1629,12 +1938,6 @@ std::shared_ptr<ITypeDeclaration> FTypeTextParseHelper::ParsePartialSimpleDeclar
         assert(!L"Fundamental types cannot be nested inside of the user defined types");
         return nullptr;
     }
-    // Make sure void type does not have any type modifiers
-    if ( bIsVoidType && !AppliedTypeModifiers.empty() )
-    {
-        assert(!L"Void type cannot have any type modifiers (including 'const')");
-        return nullptr;
-    }
     if ( WildcardTypeToken.has_value() && ( !AppliedTypeModifiers.empty() && !(AppliedTypeModifiers.size() == 1 && AppliedTypeModifiers[0] == ETypeModifier::Const) || CSUSpecifier.has_value() || OuterType != nullptr ) )
     {
         assert(!L"Type wildcards cannot have type modifiers (except for const), CSU specifier or outer type declaration");
@@ -1645,7 +1948,9 @@ std::shared_ptr<ITypeDeclaration> FTypeTextParseHelper::ParsePartialSimpleDeclar
     // Construct the void type
     if ( bIsVoidType )
     {
-        return std::make_shared<VoidTypeDeclaration>();
+        const std::shared_ptr<VoidTypeDeclaration> VoidTypeDecl = std::make_shared<VoidTypeDeclaration>();
+        VoidTypeDecl->bIsConst = bIsConst;
+        return VoidTypeDecl;
     }
     // Construct the fundamental type. Const is handled as a type modifier here and not as a separate thing
     if ( FundamentalType.has_value() )
@@ -1800,7 +2105,7 @@ bool FTypeTextParseHelper::ParseScopeAndTypeName( std::wstring& OutScopeName, st
             ConsumeNextToken();
             PreviousTypeFragment = NextToken.Identifier;
         }
-        // This is some kind of an identifier that is not a part of a typename, so end our typename here
+        // This is some kind of identifier that is not a part of a typename, so end our typename here
         else
         {
             // Make sure we parsed at least one type fragment
@@ -2055,11 +2360,11 @@ int32_t FTypeTextParseHelper::PeekNextTokenInternal(int32_t CurrentOffset, TypeT
     }
     // Match for type/integer wildcard. This is an invalid syntax in C++, even for compiler generated members
     if ( CurrentCharacter == L'?' && CurrentOffset + 1 < RawText.size() && ( iswdigit(RawText[CurrentOffset + 1]) || (
-        RawText[CurrentOffset + 1] == L'?' && CurrentOffset + 2 < RawText.size() && iswdigit(RawText[CurrentOffset + 2]) ) ) )
+        (RawText[CurrentOffset + 1] == L'?' || RawText[CurrentOffset + 1] == L'&') && CurrentOffset + 2 < RawText.size() && iswdigit(RawText[CurrentOffset + 2]) ) ) )
     {
         // Parse digits until we find non-digit token
-        bool bIsIntegerWildcard = RawText[CurrentOffset + 1] == L'?';
-        CurrentOffset += bIsIntegerWildcard ? 2 : 1;
+        const bool bIsLongWildcard = RawText[CurrentOffset + 1] == L'?' || RawText[CurrentOffset + 1] == L'&';
+        CurrentOffset += bIsLongWildcard ? 2 : 1;
         const int32_t StartOffset = CurrentOffset++;
         while ( CurrentOffset < RawText.size() && iswdigit(RawText[CurrentOffset]) )
         {
@@ -2068,7 +2373,9 @@ int32_t FTypeTextParseHelper::PeekNextTokenInternal(int32_t CurrentOffset, TypeT
         const int32_t EndOffset = CurrentOffset;
         const std::wstring StringCopy( &RawText[StartOffset], EndOffset - StartOffset );
 
-        OutToken.Type = bIsIntegerWildcard ? ETypeTextToken::IntegerWildcard : ETypeTextToken::TypeWildcard;
+        const bool bIsIntegerWildcard = bIsLongWildcard && RawText[CurrentOffset + 1] == L'?';
+        const bool bIsTypeMemberReferenceWildcard = bIsLongWildcard && RawText[CurrentOffset + 1] == L'&';
+        OutToken.Type = bIsIntegerWildcard ? ETypeTextToken::IntegerWildcard : (bIsTypeMemberReferenceWildcard ? ETypeTextToken::TypeMemberReferenceWildcard : ETypeTextToken::TypeWildcard);
         OutToken.WildcardIndex = _wtoi( StringCopy.c_str() );
         return CurrentOffset;
     }
@@ -2086,16 +2393,23 @@ int32_t FTypeTextParseHelper::PeekNextTokenInternal(int32_t CurrentOffset, TypeT
     }
     // This is an escaped identifier. We parse it until we encounter ', which is used as a closing delimiter for it
     // Escaped identifiers are only emitted by the compiler internals and are not a valid C++ syntax
+    // NOTE: These can be nested apparently, at least on MSVC
     if ( CurrentCharacter == L'`' )
     {
         int32_t StartOffset = CurrentOffset;
-        while ( CurrentOffset < RawText.size() && RawText[CurrentOffset] != L'\'' )
+        int32_t CurrentNestingDepth = 1;
+        CurrentOffset++;
+        while ( CurrentOffset < RawText.size() && CurrentNestingDepth > 0 )
         {
+            // Handle nested internal identifiers
+            if (RawText[CurrentOffset] == L'`') CurrentNestingDepth++;
+            else if (RawText[CurrentOffset] == L'\'') CurrentNestingDepth--;
             CurrentOffset++;
         }
-        CurrentOffset++;
+        assert(CurrentNestingDepth == 0 && L"Unbalanced escaped identifier parsed from token stream");
+
         OutToken.Type = ETypeTextToken::Identifier;
-        OutToken.Identifier = std::wstring_view( &RawText[StartOffset], CurrentOffset - StartOffset );
+        OutToken.Identifier = std::wstring_view( &RawText[StartOffset + 1], CurrentOffset - StartOffset - 2 );
         return CurrentOffset;
     }
     if ( CurrentCharacter == L'*' )
